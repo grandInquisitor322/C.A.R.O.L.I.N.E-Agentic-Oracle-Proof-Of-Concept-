@@ -1,0 +1,1066 @@
+// server/storage.ts
+import { eq, and, lt, or, ilike, desc, sql } from 'drizzle-orm';
+import { PGlite } from '@electric-sql/pglite';
+import { drizzle as pgliteDrizzle } from 'drizzle-orm/pglite';
+export type { InferSelectModel } from 'drizzle-orm';
+
+import {
+  users,
+  coins,
+  transactions,
+  blocks,
+  type User,
+  type InsertUser,
+  type Coin,
+  type InsertCoin,
+  type Transaction,
+  type InsertTransaction,
+  type Block,
+  type InsertBlock,
+} from '@shared/schema';
+import { db } from './db';
+
+import type { EnrichedTransaction as ChainEnrichedTransaction, TransactionCategory } from '../TransactionEnricher';
+import type { ChainSpecificUtxo as BaseUtxo } from '../ChainSpecificTypes';
+import { ChainId } from '../ChainConfig20';
+
+// ─── Re-exports ──────────────────────────────────────────────────────────────
+
+export { transactions } from '../shared/schema';
+export { eq, and, lt, or, sql };
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+/** Enriched transaction used by the app-level IStorage interface */
+type AppEnrichedTransaction = Transaction & { isConfirmed: boolean };
+
+/** Raw SQL row returned from the database (snake_case) */
+export type TransactionRow = {
+  id: number;
+  tx_id: string;
+  chain_id: number;
+  amount: bigint;
+  fee: bigint | null;
+  category: string | null;
+  status: string;
+  from_address: string | null;
+  to_address: string | null;
+  block_height: number | null;
+  confirmations: bigint;
+  timestamp: Date | null;
+  created_at: Date | null;
+};
+
+// ─── IStorage interface ───────────────────────────────────────────────────────
+
+export interface IStorage {
+  // User methods
+  getUser(id: number): Promise<User | undefined>;
+  getUserByUsername(username: string): Promise<User | undefined>;
+  createUser(user: InsertUser): Promise<User>;
+
+  // Coin methods
+  getCoin(symbol: string): Promise<Coin | undefined>;
+  getAllCoins(): Promise<Coin[]>;
+  upsertCoin(coin: InsertCoin): Promise<Coin>;
+
+  // Transaction methods
+  getTransactionsByCoin(coinSymbol: string, limit?: number): Promise<AppEnrichedTransaction[]>;
+  createTransaction(transaction: InsertTransaction): Promise<AppEnrichedTransaction>;
+
+  // Block methods
+  getBlocksByCoin(coinSymbol: string, limit?: number): Promise<Block[]>;
+  createBlock(block: InsertBlock): Promise<Block>;
+
+  // Search methods
+  searchByHash(query: string): Promise<{
+    type: 'transaction' | 'block';
+    data: AppEnrichedTransaction | Block;
+    coinSymbol: string;
+  }[]>;
+}
+
+// ─── MemStorage ───────────────────────────────────────────────────────────────
+
+export class MemStorage implements IStorage {
+  private users: Map<number, User>;
+  private coins: Map<string, Coin>;
+  private transactions: Map<number, AppEnrichedTransaction>;
+  private blocks: Map<number, Block>;
+  private currentUserId: number;
+  private currentTransactionId: number;
+  private currentBlockId: number;
+
+  constructor() {
+    this.users = new Map();
+    this.coins = new Map();
+    this.transactions = new Map();
+    this.blocks = new Map();
+    this.currentUserId = 1;
+    this.currentTransactionId = 1;
+    this.currentBlockId = 1;
+    this.initializeCoins();
+  }
+
+  private ensureInitialized(): void {
+    // No-op for in-memory storage
+  }
+
+  private initializeCoins() {
+    const dogecoin: Coin = {
+      id: 1,
+      symbol: 'DOGE',
+      name: 'Dogecoin',
+      price: '0.08230000',
+      priceChange24h: '2.34',
+      marketCap: '11800000000.00',
+      volume24h: '0.00',
+      blockHeight: 4892345,
+      blockTime: '72.00',
+      totalSupply: '142100000000.00000000',
+      circulatingSupply: '142100000000.00000000',
+      hashRate: '847.3 TH/s',
+      difficulty: '9.42M',
+      decimals: 8,
+      isActive: true,
+      metadata: JSON.stringify({}),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      chainId: 1,
+      networkMagic: 0xd9b4bef9,
+      pubKeyHash: 0x76a914,
+      supportsScrypt: false,
+    };
+
+    const litecoin: Coin = {
+      id: 2,
+      symbol: 'LTC',
+      name: 'Litecoin',
+      price: '67.50000000',
+      priceChange24h: '-1.23',
+      marketCap: '5000000000.00',
+      volume24h: '250000000.00',
+      blockHeight: 2567890,
+      blockTime: '150.00',
+      totalSupply: '84000000.00000000',
+      circulatingSupply: '74000000.00000000',
+      hashRate: '450.0 TH/s',
+      difficulty: '25.0M',
+      decimals: 8,
+      isActive: true,
+      metadata: JSON.stringify({}),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      chainId: 2,
+      networkMagic: 0xfbc0b6db,
+      pubKeyHash: 0x30,
+      supportsScrypt: true,
+    };
+
+    const digibyte: Coin = {
+      id: 3,
+      symbol: 'DGB',
+      name: 'DigiByte',
+      price: '0.00850000',
+      priceChange24h: '0.45',
+      marketCap: '150000000.00',
+      volume24h: '5000000.00',
+      blockHeight: 17894567,
+      blockTime: '90.00',
+      totalSupply: '21000000000.00000000',
+      circulatingSupply: '17900000000.00000000',
+      hashRate: '120.0 TH/s',
+      difficulty: '1.2M',
+      decimals: 8,
+      isActive: true,
+      metadata: JSON.stringify({}),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      chainId: 3,
+      networkMagic: 0xd9b4bef9,
+      pubKeyHash: 0x1e,
+      supportsScrypt: true,
+    };
+
+    this.coins.set('DOGE', dogecoin);
+    this.coins.set('LTC', litecoin);
+    this.coins.set('DGB', digibyte);
+
+    this.initializeSampleTransactions();
+    this.initializeSampleBlocks();
+  }
+
+  private initializeSampleTransactions() {
+    const sampleTxs = [
+      {
+        txId: 'a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef123456',
+        chainId: 1,
+        amount: 100050000000n,
+        fee: 100000000n,
+        confirmations: 6,
+        timestamp: new Date(Date.now() - 300000),
+        fromAddress: 'DQA8x2PyGk7DdVa6nrLQVPkqZYBWLYqKPM',
+        toAddress: 'DExy9YdXjHVBkYzBKDBNPp3V5hZhZVKwkT',
+        blockHeight: 4892345,
+        category: 'transfer',
+        status: 'confirmed',
+        createdAt: new Date(),
+      },
+      {
+        txId: 'b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef123456a1',
+        chainId: 2,
+        amount: 5000000000n,
+        fee: 100000n,
+        confirmations: 12,
+        timestamp: new Date(Date.now() - 600000),
+        fromAddress: 'Labc123Def456Ghi789Jkl012Mno345Pqr678',
+        toAddress: 'Lstu901Vwx234Yza567Bcd890Efg123Hijk456',
+        blockHeight: 2567890,
+        category: 'transfer',
+        status: 'confirmed',
+        createdAt: new Date(),
+      },
+      {
+        txId: 'c3d4e5f6789012345678901234567890abcdef1234567890abcdef123456a1b2',
+        chainId: 3,
+        amount: 100000000n,
+        fee: 50000n,
+        confirmations: 3,
+        timestamp: new Date(Date.now() - 900000),
+        fromAddress: 'Dabc123def456ghi789jkl012mno345pqr678stu901',
+        toAddress: 'Dvwy901zxa234bcd567efg890hij123klm456nop789',
+        blockHeight: 17894567,
+        category: 'transfer',
+        status: 'pending',
+        createdAt: new Date(),
+      },
+    ];
+
+    sampleTxs.forEach((txData, index) => {
+      const transaction: AppEnrichedTransaction = {
+        ...txData,
+        id: index + 1,
+        isConfirmed: (txData.confirmations ?? 0) >= 6,
+      };
+      this.transactions.set(index + 1, transaction);
+    });
+    this.currentTransactionId = sampleTxs.length + 1;
+  }
+
+  private initializeSampleBlocks() {
+    const sampleBlocks = [
+      {
+        hash: '0000000000000abc123456789012345678901234567890abcdef1234567890ab',
+        chainId: 1,
+        height: 4892345,
+        timestamp: new Date(Date.now() - 300000),
+        txCount: 156,
+        size: 1234567,
+        difficulty: '9420000',
+        nonce: '1234567890',
+        previousHash: '0000000000000def456789012345678901234567890123def456789012cde',
+        confirmations: 1,
+        createdAt: new Date(),
+      },
+      {
+        hash: '0000000000000def456789012345678901234567890123def4567890123456',
+        chainId: 2,
+        height: 2567890,
+        timestamp: new Date(Date.now() - 600000),
+        txCount: 89,
+        size: 987654,
+        difficulty: '25000000',
+        nonce: '0987654321',
+        previousHash: '0000000000000abc123456789012345678901234567890abcdef1234567890',
+        confirmations: 5,
+        createdAt: new Date(),
+      },
+      {
+        hash: '0000000000000ghi7890123456789012345678901234567890abcdef1234567',
+        chainId: 3,
+        height: 17894567,
+        timestamp: new Date(Date.now() - 900000),
+        txCount: 234,
+        size: 2345678,
+        difficulty: '1200000',
+        nonce: '1122334455',
+        previousHash: '0000000000000jkl0123456789012345678901234567890abcdef12345678',
+        confirmations: 10,
+        createdAt: new Date(),
+      },
+    ];
+
+    sampleBlocks.forEach((blockData, index) => {
+      const block: Block = { ...blockData, id: index + 1 };
+      this.blocks.set(index + 1, block);
+    });
+    this.currentBlockId = sampleBlocks.length + 1;
+  }
+
+  // User methods
+  async getUser(id: number): Promise<User | undefined> {
+    this.ensureInitialized();
+    return this.users.get(id);
+  }
+
+  async getUserByUsername(username: string): Promise<User | undefined> {
+    this.ensureInitialized();
+    return Array.from(this.users.values()).find((u) => u.username === username);
+  }
+
+  async createUser(user: InsertUser): Promise<User> {
+    this.ensureInitialized();
+    const id = this.currentUserId++;
+    const newUser: User = { ...user, id, createdAt: new Date() };
+    this.users.set(id, newUser);
+    return newUser;
+  }
+
+  // Coin methods
+  async getCoin(symbol: string): Promise<Coin | undefined> {
+    this.ensureInitialized();
+    return this.coins.get(symbol.toUpperCase());
+  }
+
+  async getAllCoins(): Promise<Coin[]> {
+    this.ensureInitialized();
+    return Array.from(this.coins.values());
+  }
+
+  async upsertCoin(insertCoin: Partial<InsertCoin> & { symbol: string }): Promise<Coin> {
+    this.ensureInitialized();
+    const symbol = insertCoin.symbol.toUpperCase();
+    const coin: Coin = {
+      id: Date.now(),
+      symbol,
+      name: insertCoin.name || 'Unknown',
+      price: insertCoin.price || '0.00',
+      priceChange24h: insertCoin.priceChange24h || '0.00',
+      marketCap: insertCoin.marketCap || '0',
+      volume24h: insertCoin.volume24h || '0',
+      blockHeight: insertCoin.blockHeight || 0,
+      blockTime: insertCoin.blockTime || '60',
+      totalSupply: insertCoin.totalSupply || '0',
+      circulatingSupply: insertCoin.circulatingSupply || '0',
+      hashRate: insertCoin.hashRate || '0 TH/s',
+      difficulty: insertCoin.difficulty || '0',
+      decimals: insertCoin.decimals ?? 8,
+      isActive: insertCoin.isActive ?? true,
+      metadata: JSON.stringify(insertCoin.metadata || {}),
+      chainId: insertCoin.chainId ?? 1,
+      networkMagic: insertCoin.networkMagic ?? 0,
+      pubKeyHash: insertCoin.pubKeyHash ?? 0,
+      supportsScrypt: insertCoin.supportsScrypt ?? false,
+      createdAt: insertCoin.createdAt ?? new Date(),
+      updatedAt: new Date(),
+    };
+    this.coins.set(symbol, coin);
+    return coin;
+  }
+
+  // Transaction methods
+  async getTransactionsByCoin(coinSymbol: string, limit: number = 50): Promise<AppEnrichedTransaction[]> {
+    this.ensureInitialized();
+    const coin = await this.getCoin(coinSymbol);
+    if (!coin) return [];
+    return Array.from(this.transactions.values())
+      .filter((tx) => tx.chainId === coin.chainId)
+      .sort((a, b) => (b.timestamp?.getTime() ?? 0) - (a.timestamp?.getTime() ?? 0))
+      .slice(0, limit);
+  }
+
+  async createTransaction(insertTransaction: InsertTransaction): Promise<AppEnrichedTransaction> {
+    this.ensureInitialized();
+    const id = this.currentTransactionId++;
+    const transaction: AppEnrichedTransaction = {
+      ...insertTransaction,
+      id,
+      createdAt: new Date(),
+      blockHeight: insertTransaction.blockHeight ?? 0,
+      fromAddress: insertTransaction.fromAddress ?? '',
+      toAddress: insertTransaction.toAddress ?? '',
+      amount: BigInt(insertTransaction.amount ?? 0n),
+      fee: BigInt(insertTransaction.fee ?? 0n),
+      timestamp: insertTransaction.timestamp ?? new Date(),
+      confirmations: insertTransaction.confirmations ?? 0,
+      category: insertTransaction.category ?? 'transfer',
+      status: insertTransaction.status ?? 'pending',
+      chainId: insertTransaction.chainId ?? 1,
+      isConfirmed: (insertTransaction.confirmations ?? 0) >= 6,
+    };
+    this.transactions.set(id, transaction);
+    return transaction;
+  }
+
+  // Block methods
+  async getBlocksByCoin(coinSymbol: string, limit: number = 50): Promise<Block[]> {
+    this.ensureInitialized();
+    const coin = await this.getCoin(coinSymbol);
+    if (!coin) return [];
+    return Array.from(this.blocks.values())
+      .filter((block) => block.chainId === coin.chainId)
+      .sort((a, b) => (b.height ?? 0) - (a.height ?? 0))
+      .slice(0, limit);
+  }
+
+  async createBlock(insertBlock: InsertBlock): Promise<Block> {
+    this.ensureInitialized();
+    const id = this.currentBlockId++;
+    const block: Block = {
+      ...insertBlock,
+      id,
+      createdAt: new Date(),
+      timestamp: insertBlock.timestamp ?? new Date(),
+      difficulty: insertBlock.difficulty ?? '0',
+      nonce: insertBlock.nonce ?? '0',
+      size: insertBlock.size ?? 0,
+      previousHash: insertBlock.previousHash ?? '',
+      txCount: insertBlock.txCount ?? 0,
+      confirmations: insertBlock.confirmations ?? 1,
+      chainId: insertBlock.chainId ?? 1,
+    };
+    this.blocks.set(id, block);
+    return block;
+  }
+
+  async searchByHash(query: string): Promise<{
+    type: 'transaction' | 'block';
+    data: AppEnrichedTransaction | Block;
+    coinSymbol: string;
+  }[]> {
+    this.ensureInitialized();
+    const results: { type: 'transaction' | 'block'; data: AppEnrichedTransaction | Block; coinSymbol: string }[] = [];
+    const q = query.toLowerCase();
+
+    for (const transaction of this.transactions.values()) {
+      if (
+        transaction.txId.toLowerCase().includes(q) ||
+        (transaction.fromAddress?.toLowerCase().includes(q) ?? false) ||
+        (transaction.toAddress?.toLowerCase().includes(q) ?? false)
+      ) {
+        const coin = this.getCoinByChainId(transaction.chainId);
+        results.push({ type: 'transaction', data: transaction, coinSymbol: coin?.symbol ?? 'UNKNOWN' });
+      }
+    }
+
+    for (const block of this.blocks.values()) {
+      if (block.hash.toLowerCase().includes(q)) {
+        const coin = this.getCoinByChainId(block.chainId);
+        results.push({ type: 'block', data: block, coinSymbol: coin?.symbol ?? 'UNKNOWN' });
+      }
+    }
+
+    return results.slice(0, 10);
+  }
+
+  private getCoinByChainId(chainId: number): Coin | undefined {
+    return Array.from(this.coins.values()).find((c) => c.chainId === chainId);
+  }
+}
+
+// ─── DatabaseStorage ──────────────────────────────────────────────────────────
+
+const initialCoins: InsertCoin[] = [
+  {
+    symbol: 'DOGE',
+    name: 'Dogecoin',
+    chainId: 1,
+    price: '0.08230000',
+    priceChange24h: '2.34',
+    marketCap: '11800000000.00',
+    volume24h: '0.00',
+    blockHeight: 4892345,
+    blockTime: '72.00',
+    totalSupply: '142100000000.00000000',
+    circulatingSupply: '142100000000.00000000',
+    hashRate: '847.3 TH/s',
+    difficulty: '9.42M',
+    decimals: 8,
+    isActive: true,
+    metadata: JSON.stringify({}),
+    networkMagic: 0xd9b4bef9,
+    pubKeyHash: 0x76a914,
+    supportsScrypt: false,
+  },
+  {
+    symbol: 'LTC',
+    name: 'Litecoin',
+    chainId: 2,
+    price: '67.50000000',
+    priceChange24h: '-1.23',
+    marketCap: '5000000000.00',
+    volume24h: '250000000.00',
+    blockHeight: 2567890,
+    blockTime: '150.00',
+    totalSupply: '84000000.00000000',
+    circulatingSupply: '74000000.00000000',
+    hashRate: '450.0 TH/s',
+    difficulty: '25.0M',
+    decimals: 8,
+    isActive: true,
+    metadata: JSON.stringify({}),
+    networkMagic: 0xfbc0b6db,
+    pubKeyHash: 0x30,
+    supportsScrypt: true,
+  },
+  {
+    symbol: 'DGB',
+    name: 'DigiByte',
+    chainId: 3,
+    price: '0.00850000',
+    priceChange24h: '0.45',
+    marketCap: '150000000.00',
+    volume24h: '5000000.00',
+    blockHeight: 17894567,
+    blockTime: '90.00',
+    totalSupply: '21000000000.00000000',
+    circulatingSupply: '17900000000.00000000',
+    hashRate: '120.0 TH/s',
+    difficulty: '1.2M',
+    decimals: 8,
+    isActive: true,
+    metadata: JSON.stringify({}),
+    networkMagic: 0xd9b4bef9,
+    pubKeyHash: 0x1e,
+    supportsScrypt: true,
+  },
+];
+
+export class DatabaseStorage implements IStorage {
+  private initialized = false;
+
+  private async ensureInitialized() {
+    if (this.initialized) return;
+    try {
+      const existingCoins = await db.select().from(coins);
+      if (existingCoins.length === 0) {
+        await db.insert(coins).values(
+          initialCoins.map((coinData) => ({ ...coinData, createdAt: new Date(), updatedAt: new Date() }))
+        );
+      }
+      this.initialized = true;
+    } catch (error) {
+      console.error('Failed to initialize storage:', error);
+      throw error;
+    }
+  }
+
+  // User methods
+  async getUser(id: number): Promise<User | undefined> {
+    await this.ensureInitialized();
+    const [user] = await db.select().from(users).where(eq(users.id, id));
+    return user;
+  }
+
+  async getUserByUsername(username: string): Promise<User | undefined> {
+    await this.ensureInitialized();
+    const [user] = await db.select().from(users).where(eq(users.username, username));
+    return user;
+  }
+
+  async createUser(user: InsertUser): Promise<User> {
+    await this.ensureInitialized();
+    const [newUser] = await db.insert(users).values({ ...user, createdAt: new Date() }).returning();
+    return newUser;
+  }
+
+  // Coin methods
+  async getCoin(symbol: string): Promise<Coin | undefined> {
+    await this.ensureInitialized();
+    const [coin] = await db.select().from(coins).where(eq(coins.symbol, symbol.toUpperCase()));
+    return coin;
+  }
+
+  async getAllCoins(): Promise<Coin[]> {
+    await this.ensureInitialized();
+    return await db.select().from(coins).orderBy(coins.id);
+  }
+
+  async upsertCoin(insertCoin: InsertCoin): Promise<Coin> {
+    await this.ensureInitialized();
+    const existing = await this.getCoin(insertCoin.symbol);
+    if (existing) {
+      const [updated] = await db
+        .update(coins)
+        .set({ ...insertCoin, updatedAt: new Date() })
+        .where(eq(coins.symbol, insertCoin.symbol))
+        .returning();
+      return updated;
+    } else {
+      const [newCoin] = await db
+        .insert(coins)
+        .values({ ...insertCoin, createdAt: new Date(), updatedAt: new Date() })
+        .returning();
+      return newCoin;
+    }
+  }
+
+  // Transaction methods
+  async getTransactionsByCoin(coinSymbol: string, limit: number = 50): Promise<AppEnrichedTransaction[]> {
+    await this.ensureInitialized();
+    const [coin] = await db.select().from(coins).where(eq(coins.symbol, coinSymbol.toUpperCase()));
+    if (!coin) return [];
+    const txs = await db
+      .select()
+      .from(transactions)
+      .where(eq(transactions.chainId, coin.chainId))
+      .orderBy(desc(transactions.timestamp))
+      .limit(limit);
+    return txs.map((tx) => ({ ...tx, isConfirmed: (tx.confirmations ?? 0) >= 6 }));
+  }
+
+  async createTransaction(insertTransaction: InsertTransaction): Promise<AppEnrichedTransaction> {
+    await this.ensureInitialized();
+    const [transaction] = await db
+      .insert(transactions)
+      .values({
+        ...insertTransaction,
+        createdAt: new Date(),
+        blockHeight: insertTransaction.blockHeight ?? 0,
+        fromAddress: insertTransaction.fromAddress ?? '',
+        toAddress: insertTransaction.toAddress ?? '',
+        amount: BigInt(insertTransaction.amount ?? 0n),
+        fee: BigInt(insertTransaction.fee ?? 0n),
+        timestamp: insertTransaction.timestamp ?? new Date(),
+        confirmations: insertTransaction.confirmations ?? 0,
+        category: insertTransaction.category ?? 'transfer',
+        status: insertTransaction.status ?? 'pending',
+        chainId: insertTransaction.chainId ?? 1,
+      })
+      .returning();
+    return { ...transaction, isConfirmed: (transaction.confirmations ?? 0) >= 6 };
+  }
+
+  // Block methods
+  async getBlocksByCoin(coinSymbol: string, limit: number = 50): Promise<Block[]> {
+    await this.ensureInitialized();
+    const [coin] = await db.select().from(coins).where(eq(coins.symbol, coinSymbol.toUpperCase()));
+    if (!coin) return [];
+    return await db
+      .select()
+      .from(blocks)
+      .where(eq(blocks.chainId, coin.chainId))
+      .orderBy(desc(blocks.timestamp))
+      .limit(limit);
+  }
+
+  async createBlock(insertBlock: InsertBlock): Promise<Block> {
+    await this.ensureInitialized();
+    const [block] = await db
+      .insert(blocks)
+      .values({
+        ...insertBlock,
+        createdAt: new Date(),
+        timestamp: insertBlock.timestamp ?? new Date(),
+        difficulty: insertBlock.difficulty ?? '0',
+        nonce: insertBlock.nonce ?? '0',
+        size: insertBlock.size ?? 0,
+        previousHash: insertBlock.previousHash ?? '',
+        txCount: insertBlock.txCount ?? 0,
+        confirmations: insertBlock.confirmations ?? 1,
+        chainId: insertBlock.chainId ?? 1,
+      })
+      .returning();
+    return block;
+  }
+
+  async searchByHash(query: string): Promise<{
+    type: 'transaction' | 'block';
+    data: AppEnrichedTransaction | Block;
+    coinSymbol: string;
+  }[]> {
+    await this.ensureInitialized();
+    const results: { type: 'transaction' | 'block'; data: AppEnrichedTransaction | Block; coinSymbol: string }[] = [];
+
+    const foundTransactions = await db.query.transactions.findMany({
+      where: or(
+        ilike(transactions.txId, `%${query}%`),
+        ilike(transactions.fromAddress, `%${query}%`),
+        ilike(transactions.toAddress, `%${query}%`)
+      ),
+      with: { coin: true },
+      limit: 5,
+      orderBy: [desc(transactions.timestamp)],
+    });
+
+    foundTransactions.forEach((tx) => {
+      results.push({
+        type: 'transaction',
+        data: { ...tx, isConfirmed: (tx.confirmations ?? 0) >= 6 },
+        coinSymbol: tx.coin?.symbol ?? 'UNKNOWN',
+      });
+    });
+
+    const foundBlocks = await db.query.blocks.findMany({
+      where: ilike(blocks.hash, `%${query}%`),
+      with: { coin: true },
+      limit: 5,
+      orderBy: [desc(blocks.timestamp)],
+    });
+
+    foundBlocks.forEach((block) => {
+      results.push({
+        type: 'block',
+        data: block,
+        coinSymbol: block.coin?.symbol ?? 'UNKNOWN',
+      });
+    });
+
+    return results.slice(0, 10);
+  }
+}
+
+// ─── StorageAdapter (chain-level UTXO & raw transaction storage) ──────────────
+
+export class StorageAdapter {
+  private db: any | null = null;
+  private client: any | null = null;
+  private initialized = false;
+  private dataDir?: string;
+
+  constructor(dataDir?: string) {
+    this.dataDir = dataDir;
+  }
+
+  private async initDB(): Promise<void> {
+    const isTest = process.env.NODE_ENV === 'test';
+
+    if (isTest || this.dataDir) {
+      const dbPath = isTest ? undefined : this.dataDir;
+      this.client = new PGlite(dbPath);
+      this.db = pgliteDrizzle(this.client);
+    } else {
+      const { drizzle } = await import('drizzle-orm/node-postgres');
+      const { Pool } = await import('pg');
+      const pool = new Pool({
+        connectionString: process.env.DATABASE_URL || 'postgres://user:pass@localhost:5432/dbname',
+      });
+      this.client = pool;
+      this.db = drizzle(this.client);
+    }
+  }
+
+  async ensureInitialized(): Promise<void> {
+    if (this.initialized) return;
+    await this.initDB();
+
+    await this.db.execute(sql`
+      CREATE TABLE IF NOT EXISTS transactions (
+        id SERIAL PRIMARY KEY,
+        tx_id TEXT UNIQUE NOT NULL,
+        chain_id INTEGER NOT NULL,
+        amount BIGINT NOT NULL DEFAULT 0,
+        fee BIGINT NOT NULL DEFAULT 0,
+        category TEXT,
+        status TEXT NOT NULL DEFAULT 'pending',
+        from_address TEXT,
+        to_address TEXT,
+        block_height INTEGER DEFAULT 0,
+        confirmations BIGINT NOT NULL DEFAULT 0,
+        timestamp TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await this.db.execute(sql`
+      CREATE TABLE IF NOT EXISTS utxos (
+        id SERIAL PRIMARY KEY,
+        txid TEXT NOT NULL,
+        vout INTEGER NOT NULL,
+        chain_id INTEGER NOT NULL,
+        value BIGINT NOT NULL,
+        script_pubkey TEXT NOT NULL,
+        address TEXT NOT NULL,
+        confirmations BIGINT NOT NULL DEFAULT 0,
+        block_height INTEGER DEFAULT 0,
+        spent BOOLEAN DEFAULT FALSE,
+        spent_txid TEXT,
+        spent_height INTEGER,
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(txid, vout)
+      )
+    `);
+
+    this.initialized = true;
+  }
+
+  async close(): Promise<void> {
+    if (this.client) {
+      try {
+        if (typeof this.client.close === 'function') {
+          await this.client.close();
+        } else if (typeof this.client.end === 'function') {
+          await this.client.end();
+        }
+      } catch (err) {
+        console.warn('Close warning:', err);
+      }
+      this.client = null;
+    }
+    this.db = null;
+    this.initialized = false;
+  }
+
+  async saveTransaction(tx: ChainEnrichedTransaction): Promise<void> {
+    await this.ensureInitialized();
+
+    const txId = tx.hash || tx.txId || 'unknown';
+    const chainId = Number(tx.chainId);
+    const amount = BigInt(tx.amount || 0);
+    const fee = BigInt(tx.fee || 0);
+    const category = tx.category || 'transfer';
+    const status = tx.status || 'pending';
+    const fromAddress = tx.from || null;
+    const toAddress = tx.to || tx.toAddress || null;
+    const blockHeight = tx.blockHeight || 0;
+    const confirmations = BigInt(tx.confirmations || 0);
+    const timestamp = tx.timestamp || new Date();
+
+    await this.db.execute(sql`
+      INSERT INTO transactions (
+        tx_id, chain_id, amount, fee, category, status,
+        from_address, to_address, block_height, confirmations, timestamp
+      )
+      VALUES (
+        ${txId}, ${chainId}, ${amount}, ${fee}, ${category}, ${status},
+        ${fromAddress}, ${toAddress}, ${blockHeight}, ${confirmations}, ${timestamp}
+      )
+      ON CONFLICT (tx_id) DO UPDATE SET
+        confirmations = EXCLUDED.confirmations,
+        block_height = EXCLUDED.block_height,
+        status = EXCLUDED.status
+    `);
+  }
+
+  async getTransactionsByAddress(
+    chainId: ChainId,
+    address: string
+  ): Promise<ChainEnrichedTransaction[]> {
+    await this.ensureInitialized();
+
+    const results = await this.db.execute(sql`
+      SELECT * FROM transactions
+      WHERE chain_id = ${Number(chainId)}
+        AND (from_address = ${address} OR to_address = ${address})
+      ORDER BY timestamp DESC
+    `);
+
+    const rows = results.rows as TransactionRow[];
+    return rows.map((row) => {
+      const txTimestamp = row.timestamp ? new Date(row.timestamp) : new Date();
+      const time = isNaN(txTimestamp.getTime()) ? 0 : txTimestamp.getTime() / 1000;
+      return {
+        hash: row.tx_id,
+        txId: row.tx_id,
+        chainId: row.chain_id as unknown as ChainId,
+        time,
+        amount: row.amount.toString(),
+        fee: row.fee?.toString() || '0',
+        category: (row.category as TransactionCategory) || undefined,
+        status: row.status || undefined,
+        from: row.from_address || undefined,
+        to: row.to_address || undefined,
+        toAddress: row.to_address || undefined,
+        blockHeight: row.block_height || undefined,
+        confirmations: Number(row.confirmations ?? 0),
+        timestamp: txTimestamp,
+      } as ChainEnrichedTransaction;
+    });
+  }
+
+  async getTransactionCount(chainId: ChainId, address: string): Promise<number> {
+    await this.ensureInitialized();
+    const result = await this.db.execute(sql`
+      SELECT COUNT(*) as count FROM transactions
+      WHERE chain_id = ${Number(chainId)}
+        AND (from_address = ${address} OR to_address = ${address})
+    `);
+    return Number(result.rows[0]?.count || 0);
+  }
+
+  async saveUTXO(utxo: BaseUtxo): Promise<void> {
+    await this.ensureInitialized();
+
+    const txid = utxo.txid;
+    const vout = utxo.vout || 0;
+    const chainId = Number(utxo.chainId);
+    const value = BigInt(utxo.value || 0);
+    const scriptPubKey = utxo.scriptPubKey || '';
+    const address = utxo.address || '';
+    const confirmations = BigInt(utxo.confirmations || 0);
+    const blockHeight = utxo.blockHeight || 0;
+    const spent = utxo.spent || false;
+    const spentTxId = utxo.spentTxId || null;
+    const spentHeight = utxo.spentHeight || null;
+    const timestamp = utxo.timestamp || new Date();
+
+    await this.db.execute(sql`
+      INSERT INTO utxos (
+        txid, vout, chain_id, value, script_pubkey, address,
+        confirmations, block_height, spent, spent_txid, spent_height, timestamp
+      )
+      VALUES (
+        ${txid}, ${vout}, ${chainId}, ${value}, ${scriptPubKey}, ${address},
+        ${confirmations}, ${blockHeight}, ${spent}, ${spentTxId}, ${spentHeight}, ${timestamp}
+      )
+      ON CONFLICT (txid, vout) DO UPDATE SET
+        confirmations = EXCLUDED.confirmations,
+        block_height = EXCLUDED.block_height,
+        spent = EXCLUDED.spent,
+        spent_txid = EXCLUDED.spent_txid,
+        spent_height = EXCLUDED.spent_height
+    `);
+  }
+
+  async getUTXOs(
+    chainId: ChainId,
+    address: string,
+    minConfirmations: number = 0
+  ): Promise<BaseUtxo[]> {
+    await this.ensureInitialized();
+
+    const results = await this.db.execute(sql`
+      SELECT * FROM utxos
+      WHERE chain_id = ${Number(chainId)}
+        AND address = ${address}
+        AND spent = FALSE
+        AND confirmations >= ${minConfirmations}
+      ORDER BY confirmations DESC, value DESC
+    `);
+
+    return (results.rows as any[]).map((row) => ({
+      chainId: row.chain_id as unknown as ChainId,
+      addressType: 'p2pkh' as any,
+      scriptType: 'standard' as any,
+      config: {} as any,
+      txid: row.txid,
+      vout: row.vout,
+      value: row.value.toString(),
+      scriptPubKey: row.script_pubkey,
+      address: row.address,
+      confirmations: Number(row.confirmations),
+      blockHeight: row.block_height,
+      timestamp: row.timestamp,
+      spent: row.spent,
+    } as BaseUtxo));
+  }
+
+  async markUTXOAsSpent(
+    txid: string,
+    vout: number,
+    spentTxId: string,
+    spentHeight: number
+  ): Promise<void> {
+    await this.ensureInitialized();
+    await this.db.execute(sql`
+      UPDATE utxos
+      SET spent = TRUE, spent_txid = ${spentTxId}, spent_height = ${spentHeight}
+      WHERE txid = ${txid} AND vout = ${vout}
+    `);
+  }
+
+  async getAddressBalance(chainId: ChainId, address: string): Promise<string> {
+    await this.ensureInitialized();
+    const result = await this.db.execute(sql`
+      SELECT COALESCE(SUM(value), 0) as balance FROM utxos
+      WHERE chain_id = ${Number(chainId)}
+        AND address = ${address}
+        AND spent = FALSE
+    `);
+    const balance = result.rows[0]?.balance || 0n;
+    return balance.toString();
+  }
+
+  async pruneOldTransactions(
+    chainId: ChainId,
+    minConfirmations: number,
+    olderThanDays?: number
+  ): Promise<number> {
+    await this.ensureInitialized();
+
+    let query = sql`
+      DELETE FROM transactions
+      WHERE chain_id = ${Number(chainId)}
+        AND confirmations < ${minConfirmations}
+    `;
+
+    if (olderThanDays) {
+      const cutoffDate = new Date(Date.now() - olderThanDays * 86400000);
+      query = sql`
+        DELETE FROM transactions
+        WHERE chain_id = ${Number(chainId)}
+          AND confirmations < ${minConfirmations}
+          AND timestamp < ${cutoffDate}
+      `;
+    }
+
+    const result = await this.db.execute(query);
+    return result.rowCount || 0;
+  }
+
+  async pruneSpentUTXOs(chainId: ChainId, olderThanDays: number = 30): Promise<number> {
+    await this.ensureInitialized();
+    const cutoffDate = new Date(Date.now() - olderThanDays * 86400000);
+    const result = await this.db.execute(sql`
+      DELETE FROM utxos
+      WHERE chain_id = ${Number(chainId)}
+        AND spent = TRUE
+        AND timestamp < ${cutoffDate}
+    `);
+    return result.rowCount || 0;
+  }
+
+  async getStatistics(chainId: ChainId): Promise<{
+    totalTransactions: number;
+    totalUTXOs: number;
+    spentUTXOs: number;
+    totalValue: string;
+  }> {
+    await this.ensureInitialized();
+
+    const txCount = await this.db.execute(sql`
+      SELECT COUNT(*) as count FROM transactions WHERE chain_id = ${Number(chainId)}
+    `);
+
+    const utxoStats = await this.db.execute(sql`
+      SELECT
+        COUNT(*) as total,
+        SUM(CASE WHEN spent = TRUE THEN 1 ELSE 0 END) as spent,
+        COALESCE(SUM(CASE WHEN spent = FALSE THEN value ELSE 0 END), 0) as value
+      FROM utxos
+      WHERE chain_id = ${Number(chainId)}
+    `);
+
+    const stats = utxoStats.rows[0] || {};
+    return {
+      totalTransactions: Number(txCount.rows[0]?.count || 0),
+      totalUTXOs: Number(stats.total || 0),
+      spentUTXOs: Number(stats.spent || 0),
+      totalValue: (stats.value || 0n).toString(),
+    };
+  }
+}
+
+// ─── searchByHash (standalone export) ────────────────────────────────────────
+
+export async function searchByHash(hash: string): Promise<Array<{
+  type: 'block' | 'transaction';
+  data: Block | TransactionRow;
+  coinSymbol: string;
+}>> {
+  return [];
+}
+
+// ─── Default exports ──────────────────────────────────────────────────────────
+
+const storageImpl = process.env.NODE_ENV === 'production'
+  ? new DatabaseStorage()
+  : new MemStorage();
+
+export default storageImpl;
+
+/** App-level storage (MemStorage in dev, DatabaseStorage in prod) */
+export const storage = storageImpl;
+
+/** Chain-level UTXO/transaction storage adapter */
+export const storageAdapter = new StorageAdapter();
